@@ -1,0 +1,289 @@
+---
+title: "Projekt"
+author: "Maciej Biliński"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: true
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Podsumowanie
+Najczęściej wykorzystywanymi bateriami są baterie litowe. Można dla nich zaobserwować największe średnie napięcie. Często bada się także baterie oparte na magnezie, cynku, wapniu czy sodzie. Baterie oparte na magnezie potrafią osiągnąć znacznie większe wartości zmiany objętności. Model regresji liniowej oparty na średnim napięciu, pojemnościach i one-hot-encodingu głównego jonu średnio radzi sobie w przewidywaniu gęstości energii w odniesieniu do masy baterii.
+
+## Biblioteki
+
+```{r, warning=FALSE, message=FALSE}
+library(knitr)
+library(DT)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(corrplot)
+library(caret)
+library(tidyr)
+```
+
+## Seed
+
+```{r}
+set.seed(2024)
+```
+
+## Opis danych
+
+-   Battery ID: Identyfikator baterii.
+-   Battery Formula: Wzór chemiczny materiału baterii.
+-   Working Ion: Główny jon, który odpowiada za transport ładunku w baterii.
+-   Formula Charge: Wzór chemiczny materiału baterii w stanie naładowanym.
+-   Formula Discharge: Wzór chemiczny materiału baterii w stanie rozładowanym.
+-   Max Delta Volume: Zmiana objętości w % dla danego kroku napięcia za pomocą wzoru: max(charge, discharge)/min(charge, discharge) -1.
+-   Average Voltage: Średnie napięcie dla poszczególnego kroku napięcia.
+-   Gravimetric Capacity: Pojemność grawimetryczna, czyli ilość energii na jednostkę masy (mAh/g).
+-   Volumetric Capacity: Pojemność wolumetryczna, czyli ilość energii na jednostkę objętości (mAh/cm3).
+-   Gravimetric Energy: Gęstość energii w odniesieniu do masy baterii (Wh/kg).
+-   Volumetric Energy: Gęstość energii w odniesieniu do objętości baterii (Wh/L).
+-   Atomic Fraction Charge: Udział atomowy składników w stanie naładowanym.
+-   Atomic Fraction Discharge: Udział atomowy składników w stanie rozładowanym.
+-   Stability Charge: Wskaźnik stabilności materiału w stanie naładowanym.
+-   Stability Discharge: Wskaźnik stabilności materiału w stanie rozładowanym.
+-   Steps: Liczba odrębnych kroków napięcia od pełnego naładowania do rozładowania, oparta na stabilnych stanach pośrednich.
+-   Max Voltage Step: Maksymalna bezwzględna różnica między sąsiednimi krokami napięcia.
+
+## Wczytanie danych
+
+```{r, echo=FALSE, results='hide'}
+prettyTable <- function(table_df, round_digits=2) {
+    DT::datatable(table_df, style="bootstrap", filter = "top", rownames = FALSE, extensions = "Buttons", options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print'))) %>% formatRound(names(dplyr::select_if(table_df, is.numeric)), round_digits)
+}
+```
+
+```{r}
+df = read.csv("mp_batteries.csv")
+prettyTable(df)
+```
+
+## Czyszczenie danych
+Average.Voltage, Gravimetric.Energy, Volumetric.Energy przyjmują ujemne wartości z powodu kierunku prądu. Kierunek prądu nie będzie przydatny w tej analizie, więc zastostuję transformację, aby wszystkie wartości były nieujemne.
+```{r}
+df <- df %>%
+  mutate(
+    Average.Voltage = abs(Average.Voltage),
+    Gravimetric.Energy = abs(Gravimetric.Energy),
+    Volumetric.Energy = abs(Volumetric.Energy)
+  )
+```
+
+## Podstawowa analiza danych
+
+```{r}
+knitr::kable(summary(df))
+```
+
+Zbiór danych zawiera `r nrow(df)` rekordów, w tym `r nrow(df[apply(is.na(df), 1, any), ])` z wartościami pustymi.
+
+## Szczegółowa analiza cech
+### Working Ion
+```{r}
+working.ion.count <- df %>%
+  count(Working.Ion) %>%
+  rename(Count = n)
+
+ggplot(
+  working.ion.count,
+  aes(
+    x = Working.Ion,
+    y = Count,
+    fill = Working.Ion
+  )
+) +
+  geom_col() +
+  labs(
+    title = "Ilość unikalnych głównych jonów",
+    x = "Główny jon",
+    y = "Ilość"
+  ) 
+```
+
+Zbiór danych zawiera najwięcej baterii opartych na licie.
+
+### Max Delta Volume
+Przedział wartości zmiany objętości jest bardzo duży. Wartości poniżej 1 dotyczą `r floor(nrow(df[df['Max.Delta.Volume'] < 1, ])/nrow(df)*100)`% zbioru danych. Ale największą wartością jest `r max(df$Max.Delta.Volume)`. Z tego powodu histogram nie za dobrze przedstawi rozkład wartości. 
+```{r, echo=FALSE}
+ggplot(df, aes(x = Max.Delta.Volume)) +
+  geom_histogram(bins=30) +
+  labs(
+    title = "Histogram zmiennej Max.Delta.Volume",
+    x = "Max.Delta.Volume",
+    y = "Częstotliwość"
+  ) 
+```
+
+Warto zastanowić się co ma wpływ na bardzo wysokie wartości `Max Delta Volume`. W dalszej części analizy przyjrzymy się korelacji pomiędzy zmiennymi, aby odpowiedzieć sobie na to pytanie. W tej sekcji sprawdzimy jedynie statystyki `Max Delta Volume` dla poszczególnych głównych jonów.
+```{r}
+df %>%
+  group_by(Working.Ion) %>%
+  summarise(
+    Min.Max.Delta.Volume = min(Max.Delta.Volume),
+    Max.Max.Delta.Volume = max(Max.Delta.Volume),
+    Mean.Max.Delta.Volume = mean(Max.Delta.Volume),
+    SD.Max.Delta.Volume = sd(Max.Delta.Volume),
+    Count = n()
+  ) %>%
+  prettyTable
+```
+Magnes zdecydowanie wyróżnia się na tle innych jonów.
+
+### Average.Voltage
+```{r, echo=FALSE}
+ggplot(df, aes(x = Average.Voltage)) +
+  geom_histogram(bins=30) +
+  labs(
+    title = "Histogram zmiennej Average.Voltage",
+    x = "Average.Voltage",
+    y = "Częstotliwość"
+  ) 
+```
+
+```{r}
+df %>%
+  group_by(Working.Ion) %>%
+  summarise(
+    Min.Average.Voltage = min(Average.Voltage),
+    Max.Average.Voltage = max(Average.Voltage),
+    Mean.Average.Voltage = mean(Average.Voltage),
+    SD.Average.Voltage = sd(Average.Voltage),
+    Count = n()
+  ) %>%
+  prettyTable
+```
+
+Tym razem największe średnie napięcie można zaobserwować dla baterii litowych.
+
+### Capacity
+```{r}
+# Histogram dla Gravimetric.Capacity
+hist_gravimetric <- ggplot(df, aes(x = Gravimetric.Capacity)) +
+  geom_histogram(bins=30) +
+  labs(title = "Histogram Gravimetric.Capacity", x = "Geometric Capacity", y = "Częstotliwość")
+
+# Histogram dla Volumetric.Capacity
+hist_volumetric <- ggplot(df, aes(x = Volumetric.Capacity)) +
+  geom_histogram(bins=30) +
+  labs(title = "Histogram Volumetric.Capacity", x = "Volumetric Capacity", y = "Częstotliwość")
+
+grid.arrange(hist_gravimetric, hist_volumetric, ncol=2)
+```
+
+### Energy
+```{r}
+# Histogram dla Gravimetric.Energy
+hist_gravimetric <- ggplot(df, aes(x = Gravimetric.Energy)) +
+  geom_histogram(bins=30) +
+  labs(title = "Histogram Gravimetric.Energy", x = "Geometric Energy", y = "Częstotliwość")
+
+# Histogram dla Volumetric.Energy
+hist_volumetric <- ggplot(df, aes(x = Volumetric.Energy)) +
+  geom_histogram(bins=30) +
+  labs(title = "Histogram Volumetric.Energy", x = "Volumetric Energy", y = "Częstotliwość")
+
+grid.arrange(hist_gravimetric, hist_volumetric, ncol=2)
+```
+
+### Stability
+```{r}
+ggplot(df) +
+  geom_histogram(aes(x = Stability.Charge), 
+                 fill = "yellow", color = "black", alpha = 0.5, 
+                 bins=30) +
+  geom_histogram(aes(x = Stability.Discharge), 
+                 fill = "red", color = "black", alpha = 0.5, 
+                 bins = 30) +
+  labs(title = "Histogramy Stability.Charge i Stability.Discharge", 
+       x = "Wartości", y = "Częstotliwość")
+```
+
+## Korelacje między cechami
+```{r}
+selected_df <- df %>%
+  select(
+    Max.Delta.Volume,
+    Average.Voltage,
+    Gravimetric.Capacity,
+    Volumetric.Capacity,
+    Gravimetric.Energy,
+    Volumetric.Energy,
+    Stability.Charge,
+    Stability.Discharge,
+    Max.Voltage.Step
+  )
+cor_matrix <- cor(selected_df)
+cor_matrix[lower.tri(cor_matrix, diag = TRUE)] <- NA
+corrplot(cor_matrix, method = "circle", type = "upper", 
+         tl.cex = 0.8, number.cex = 0.7, diag = FALSE, 
+         tl.col = "black",
+         addCoef.col = "black",
+         col=colorRampPalette(c("cornflowerblue", "white", "indianred1"))(200))
+```
+
+Można zaobserwować wysoką korelację pomiędzy Gravimetric.Energy i Volumetric.Energy. Jak również Gravimetric.Capacity i Volumetric.Capacity. A także Stability.Charge i Stability.Discharge. Co ciekawe można także zaobserwować całkiem wysoką korelację pomiędzy Average.Voltage i Gravimetric.Energy.
+
+## Predykcja Gravimetric.Energy
+### Przygotowanie danych
+```{r}
+data = df %>%
+  select(
+    Working.Ion,
+    Average.Voltage, 
+    Gravimetric.Capacity,
+    Volumetric.Capacity,
+    Gravimetric.Energy
+  ) %>%
+  mutate(Working.Ion = as.factor(Working.Ion)) %>%
+  mutate(value = 1)  %>% # one-hot-encoding
+  spread(Working.Ion, value,  fill = 0 ) 
+```
+
+### Podział danych
+```{r}
+trainIndex <- createDataPartition(data$Gravimetric.Energy, p = 0.8, list = FALSE)
+trainData <- data[trainIndex, ]
+testData <- data[-trainIndex, ]
+```
+
+### Standaryzacja
+```{r}
+preProcessParams <- preProcess(trainData[, c("Average.Voltage", "Gravimetric.Capacity", 
+                                             "Volumetric.Capacity")], 
+                               method = "range")
+
+trainDataScaled <- predict(preProcessParams, trainData)
+testDataScaled <- predict(preProcessParams, testData)
+```
+
+### Trening
+```{r}
+model <- lm(Gravimetric.Energy ~ ., data = trainDataScaled)
+```
+
+### Ewaluacja
+```{r}
+predictions <- predict(model, newdata = testDataScaled)
+R2 <- cor(predictions, testDataScaled$Gravimetric.Energy)^2
+```
+
+Model uzyskał wartość R^2 równą `r R2.
+
+### Wizualizacja
+```{r}
+ggplot(data.frame(Actual = testData$Gravimetric.Energy, Predicted = predictions), aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Rzeczywiste vs przewidywane wartości",
+       x = "Rzeczywiste wartości",
+       y = "Przewidywane wartości")
+```
